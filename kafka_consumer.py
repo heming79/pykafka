@@ -1,9 +1,12 @@
+import kafka_python_313_fix
+
 import json
 import time
 from datetime import datetime
-from confluent_kafka import Consumer, KafkaException, KafkaError
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError
 import redis
-from typing import Optional, Dict, Any, Callable, List
+from typing import Optional, Dict, Any, Callable
 import logging
 import threading
 
@@ -25,25 +28,22 @@ class KafkaMessageConsumer:
     def connect_kafka(self) -> bool:
         try:
             logger.info(f"Connecting to Kafka at {self.config.KAFKA_BOOTSTRAP_SERVERS}")
-            
-            consumer_config = {
-                'bootstrap.servers': self.config.KAFKA_BOOTSTRAP_SERVERS,
-                'group.id': self.config.KAFKA_GROUP_ID,
-                'auto.offset.reset': 'earliest',
-                'enable.auto.commit': True,
-                'auto.commit.interval.ms': 5000,
-                'fetch.min.bytes': 1,
-                'fetch.max.wait.ms': 500,
-            }
-            
-            self.consumer = Consumer(consumer_config)
-            
-            self.consumer.subscribe([self.config.KAFKA_TOPIC])
-            
+            self.consumer = KafkaConsumer(
+                self.config.KAFKA_TOPIC,
+                bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
+                group_id=self.config.KAFKA_GROUP_ID,
+                auto_offset_reset='earliest',
+                enable_auto_commit=True,
+                value_deserializer=lambda x: json.loads(x.decode('utf-8')) if x else None,
+                key_deserializer=lambda x: x.decode('utf-8') if x else None
+            )
             logger.info("Successfully connected to Kafka")
             return True
-        except KafkaException as e:
+        except KafkaError as e:
             logger.error(f"Failed to connect to Kafka: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error connecting to Kafka: {e}")
             return False
     
     def connect_redis(self) -> bool:
@@ -60,6 +60,9 @@ class KafkaMessageConsumer:
             return True
         except redis.RedisError as e:
             logger.error(f"Failed to connect to Redis: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error connecting to Redis: {e}")
             return False
     
     def connect(self) -> bool:
@@ -86,6 +89,9 @@ class KafkaMessageConsumer:
         except redis.RedisError as e:
             logger.error(f"Failed to increment message count: {e}")
             return 0
+        except Exception as e:
+            logger.error(f"Unexpected error incrementing message count: {e}")
+            return 0
     
     def get_minute_count(self, minute_str: Optional[str] = None) -> int:
         if not self.redis_client:
@@ -102,6 +108,9 @@ class KafkaMessageConsumer:
             return int(count) if count else 0
         except redis.RedisError as e:
             logger.error(f"Failed to get message count: {e}")
+            return 0
+        except Exception as e:
+            logger.error(f"Unexpected error getting message count: {e}")
             return 0
     
     def get_all_minute_counts(self) -> Dict[str, int]:
@@ -121,42 +130,18 @@ class KafkaMessageConsumer:
         except redis.RedisError as e:
             logger.error(f"Failed to get all message counts: {e}")
             return {}
+        except Exception as e:
+            logger.error(f"Unexpected error getting all message counts: {e}")
+            return {}
     
-    def _deserialize_message(self, msg) -> Optional[Dict[str, Any]]:
+    def process_message(self, message: Any) -> bool:
         try:
-            value = msg.value()
-            if value is None:
-                return None
-            return json.loads(value.decode('utf-8'))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error(f"Failed to deserialize message: {e}")
-            return None
-    
-    def _deserialize_key(self, msg) -> Optional[str]:
-        try:
-            key = msg.key()
-            if key is None:
-                return None
-            return key.decode('utf-8')
-        except UnicodeDecodeError as e:
-            logger.error(f"Failed to deserialize key: {e}")
-            return None
-    
-    def process_message(self, msg) -> bool:
-        try:
-            message_value = self._deserialize_message(msg)
-            message_key = self._deserialize_key(msg)
-            
-            if message_value is None:
-                logger.warning("Received message with None value")
-                return False
-            
-            logger.info(f"Received message - Key: {message_key}, Value: {message_value}")
+            logger.info(f"Received message: {message.value}")
             
             timestamp = None
-            if isinstance(message_value, dict):
-                if 'timestamp' in message_value:
-                    timestamp = message_value['timestamp']
+            if isinstance(message.value, dict):
+                if 'timestamp' in message.value:
+                    timestamp = message.value['timestamp']
             
             self.increment_message_count(timestamp)
             
@@ -187,31 +172,23 @@ class KafkaMessageConsumer:
                     logger.info(f"Timeout reached ({timeout}s), stopping consumer")
                     break
                 
-                msg = self.consumer.poll(
-                    timeout=self.config.CONSUMER_POLL_TIMEOUT
+                messages = self.consumer.poll(
+                    timeout_ms=int(self.config.CONSUMER_POLL_TIMEOUT * 1000)
                 )
                 
-                if msg is None:
-                    continue
-                
-                if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        logger.info(
-                            f"Reached end of partition {msg.partition()} "
-                            f"at offset {msg.offset()}"
-                        )
-                    else:
-                        logger.error(f"Kafka error: {msg.error()}")
-                else:
-                    if message_handler:
-                        message_handler(msg)
-                    else:
-                        self.process_message(msg)
+                for topic_partition, records in messages.items():
+                    for record in records:
+                        if message_handler:
+                            message_handler(record)
+                        else:
+                            self.process_message(record)
                             
         except KeyboardInterrupt:
             logger.info("Consumer interrupted by user")
-        except KafkaException as e:
+        except KafkaError as e:
             logger.error(f"Kafka error: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
         finally:
             self.running = False
             logger.info(f"Consumer stopped. Total messages processed: {self._message_count}")
